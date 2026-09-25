@@ -1,0 +1,42 @@
+name: Cloud SKIP real workerd verification
+
+on:
+  push:
+    branches: [test/linux-workerd-skip-mvp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-workerd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build from the original shared Core
+        run: node cloud-executor/scripts/build.mjs
+      - name: Contract and recovery checks
+        run: node --test tests/cloud-contract.test.mjs tests/cloud-execution.test.mjs tests/cloud-recovery.test.mjs tests/cloud-http.test.mjs
+      - name: Real Linux workerd, Durable Object Alarm, replay and Web ACK
+        shell: bash
+        run: |
+          mkdir -p verification
+          set -o pipefail
+          node --test tests/cloud-runtime.test.mjs 2>&1 | tee verification/linux-workerd.txt
+      - name: Retain real runtime log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-skip-linux-workerd-log
+          path: verification/linux-workerd.txt
+          if-no-files-found: ignore

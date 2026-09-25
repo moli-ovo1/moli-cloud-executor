@@ -1,0 +1,6 @@
+node_modules/
+dist/
+test-results/
+workerd-test-*/
+browser-outbox-*/
+*.log

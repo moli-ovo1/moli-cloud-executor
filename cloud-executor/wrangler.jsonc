@@ -1,0 +1,8 @@
+{
+  "name": "moli-cloud-skip-mvp",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-07-30",
+  "workers_dev": false,
+  "durable_objects": {"bindings": [{"name":"CHARACTERS","class_name":"CharacterExecution"}]},
+  "migrations": [{"tag":"cloud-skip-v1","new_sqlite_classes":["CharacterExecution"]}]
+}

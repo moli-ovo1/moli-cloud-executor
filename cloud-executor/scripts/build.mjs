@@ -1,0 +1,12 @@
+import { bundle } from './bundle.mjs';
+import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { CORE_VERSION } from '../../src/cloud-wake/contract.mjs';
+const core=await readFile('src/automation/headless-character-wake-core.mjs');
+if('sha256:'+createHash('sha256').update(core).digest('hex')!==CORE_VERSION) throw new Error('Shared Core fingerprint changed; review before building');
+await mkdir('dist',{recursive:true});
+const result=await bundle({entryPoints:['./cloud-executor/src/worker.mjs'],outfile:'dist/worker.mjs',metafile:true});
+const forbidden=Object.keys(result.metafile.inputs).filter(p=>/storage\/|server-plugin|tool-gateway|mcp-client|provider-registry|tavern-|phone-panel/.test(p));
+if(forbidden.length) throw new Error('Forbidden Cloud dependency: '+forbidden.join(','));
+await writeFile('dist/worker-metafile.json',JSON.stringify(result.metafile,null,2));
+console.log('Shared Core verified; Worker built; '+Object.keys(result.metafile.inputs).length+' modules, no browser store/MCP/provider dependencies.');

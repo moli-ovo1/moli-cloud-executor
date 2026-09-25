@@ -1,0 +1,229 @@
+import { identityError } from '../tools/identity-context.js';
+import { readJson, writeJson } from './storage-adapter.js';
+
+const MCP_SERVERS_KEY = 'moli-phone:mcp-servers:v1';
+const MCP_WAKE_READ_KEY = 'moli-phone:mcp-wake-read:v1';
+const MCP_WAKE_PLAY_KEY = 'moli-phone:mcp-wake-play:v1';
+const MCP_SCHEMA_VERSION = 1;
+
+function makeId() {
+  try { return `mcp-${crypto.randomUUID()}`; } catch {}
+  return `mcp-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function normalizeHeaders(raw) {
+  const input = raw && typeof raw === 'object' ? raw : {};
+  const result = {};
+  for (const [key, value] of Object.entries(input)) {
+    const name = String(key || '').trim();
+    if (!name) continue;
+    result[name] = String(value ?? '');
+  }
+  return result;
+}
+
+export function sanitizeMcpServer(raw = {}) {
+  const auth = raw.auth && typeof raw.auth === 'object' ? raw.auth : {};
+  const type = ['none', 'bearer', 'header'].includes(String(auth.type)) ? String(auth.type) : 'none';
+  return {
+    id: String(raw.id || makeId()),
+    name: String(raw.name || '').trim() || '未命名 MCP',
+    url: String(raw.url || '').trim(),
+    enabled: raw.enabled !== false,
+    auth: {
+      type,
+      token: String(auth.token || ''),
+      headerName: String(auth.headerName || 'X-API-Key').trim() || 'X-API-Key',
+      headerValue: String(auth.headerValue || ''),
+    },
+    headers: normalizeHeaders(raw.headers),
+    actorEndpoints: normalizeHeaders(raw.actorEndpoints),
+    actorBindings: raw.actorBindings && typeof raw.actorBindings === 'object' ? structuredClone(raw.actorBindings) : {},
+    identityRevision: String(raw.identityRevision || 'legacy'),
+    access: {
+      scope: raw.access?.scope === 'characters' ? 'characters' : 'global',
+      characterIds: Array.isArray(raw.access?.characterIds) ? [...new Set(raw.access.characterIds.map(x => String(x || '').trim()).filter(Boolean))] : [],
+      allowWake: raw.access?.allowWake === true,
+      fullToolAccessApproved: raw.access?.fullToolAccessApproved === true,
+      readPolicy: raw.access?.readPolicy === 'deny' ? 'deny' : 'allow',
+      writePolicy: raw.access?.writePolicy === 'deny' ? 'deny' : 'allow',
+    },
+    createdAt: Number(raw.createdAt) || Date.now(),
+    updatedAt: Number(raw.updatedAt) || Date.now(),
+  };
+}
+
+function readState() {
+  const raw = readJson(MCP_SERVERS_KEY, null);
+  const servers = Array.isArray(raw?.servers) ? raw.servers.map(sanitizeMcpServer) : [];
+  return { schemaVersion: MCP_SCHEMA_VERSION, servers };
+}
+
+function writeState(state) {
+  const normalized = {
+    schemaVersion: MCP_SCHEMA_VERSION,
+    servers: Array.isArray(state?.servers) ? state.servers.map(sanitizeMcpServer) : [],
+  };
+  writeJson(MCP_SERVERS_KEY, normalized);
+  return normalized;
+}
+
+export function listMcpServers() { return readState().servers; }
+export function getMcpServer(id) { return listMcpServers().find(item => item.id === String(id)) || null; }
+
+function sharedIdentity(server) {
+  const auth = server.auth || {};
+  const headers = Object.fromEntries(Object.entries(server.headers || {}).sort(([a], [b]) => a.localeCompare(b)));
+  return JSON.stringify({ url: server.url, type: auth.type,
+    token: auth.type === 'bearer' ? auth.token : '',
+    headerName: auth.type === 'header' ? auth.headerName : '',
+    headerValue: auth.type === 'header' ? auth.headerValue : '', headers });
+}
+
+export function saveMcpServer(raw) {
+  const current = readState();
+  const existing = raw?.id ? current.servers.find(item => item.id === String(raw.id)) : null;
+  const now = Date.now();
+  const next = sanitizeMcpServer({
+    ...(existing || {}),
+    ...(raw || {}),
+    id: existing?.id || raw?.id || makeId(),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    identityRevision: existing?.identityRevision || makeId(),
+  });
+  if (existing) {
+    // Dedicated capability URLs do not inherit shared credentials. Preserve
+    // their version when only another character or the shared account changes.
+    for (const [actor, binding] of Object.entries(next.actorBindings)) {
+      const old = existing.actorBindings?.[actor];
+      if (old?.approved && old.endpoint === next.actorEndpoints?.[actor]
+          && old.accountId === binding?.accountId && binding?.approved
+          && binding.endpoint === next.actorEndpoints?.[actor])
+        next.actorBindings[actor] = { ...binding, revision: old.revision || existing.identityRevision };
+      else if (binding?.approved && binding.endpoint === next.actorEndpoints?.[actor])
+        next.actorBindings[actor] = { ...binding, revision: makeId() };
+    }
+    if (sharedIdentity(existing) !== sharedIdentity(next)) next.identityRevision = makeId();
+  }
+  const index = current.servers.findIndex(item => item.id === next.id);
+  if (index >= 0) current.servers[index] = next;
+  else current.servers.push(next);
+  writeState(current);
+  return next;
+}
+
+export function deleteMcpServer(id) {
+  const current = readState();
+  const before = current.servers.length;
+  current.servers = current.servers.filter(item => item.id !== String(id));
+  if (current.servers.length !== before) writeState(current);
+  return current.servers.length !== before;
+}
+
+export function setMcpActorEndpoint(serverId, actorId, url, { approved = false } = {}) {
+  if (!approved) throw identityError('外部账号绑定需要明确授权。');
+  const server = getMcpServer(serverId);
+  const actor = String(actorId || '').trim();
+  const endpoint = String(url || '').trim();
+  if (!server || !actor || !/^https?:\/\//i.test(endpoint)) return null;
+  if (server.actorEndpoints?.[actor] === endpoint && server.actorBindings?.[actor]?.approved
+      && server.actorBindings[actor].endpoint === endpoint) return server;
+  return saveMcpServer({ ...server, actorEndpoints: { ...(server.actorEndpoints || {}), [actor]: endpoint }, actorBindings: { ...server.actorBindings, [actor]: { accountId: makeId(), revision: makeId(), endpoint, approved: true } } });
+}
+
+export function getMcpActorEndpoint(serverId, actorId) {
+  const server = getMcpServer(serverId);
+  return String(server?.actorEndpoints?.[String(actorId || '').trim()] || '').trim();
+}
+
+export function clearMcpActorEndpoint(serverId, actorId) {
+  const server = getMcpServer(serverId);
+  const actor = String(actorId || '').trim();
+  if (!server || !actor || !server.actorEndpoints?.[actor]) return server || null;
+  const actorEndpoints = { ...(server.actorEndpoints || {}) };
+  delete actorEndpoints[actor];
+  const actorBindings = { ...server.actorBindings };
+  delete actorBindings[actor];
+  return saveMcpServer({ ...server, actorEndpoints, actorBindings });
+}
+
+export function resolveMcpBinding(server, characterId) {
+  const id = String(characterId || '').trim();
+  if (!id) throw identityError('缺少 Character 身份。');
+  const endpoint = server.actorEndpoints?.[id];
+  const binding = server.actorBindings?.[id];
+  if (endpoint && (!binding?.approved || binding.endpoint !== endpoint || !binding.accountId)) {
+    throw identityError('旧专属 MCP 账号尚未确认，请在 MCP 设置中保存并确认绑定。');
+  }
+  const identity = { domain: 'mcp-account', characterId: id, serverId: server.id,
+    accountId: endpoint ? binding.accountId : `shared:${server.id}`,
+    revision: endpoint ? (binding.revision || server.identityRevision || 'legacy') : (server.identityRevision || 'legacy'),
+    mode: endpoint ? 'dedicated' : 'authorized-shared' };
+  // A dedicated capability URL is a separate credential. Never inherit shared account headers.
+  return { identity, server: endpoint ? { ...server, url: endpoint, auth: { type: 'none' }, headers: {} } : server };
+}
+
+export function listCharacterMcpBindings(characterId, { wake = false } = {}) {
+  return listMcpServers().filter(s => s.enabled && (!wake || s.access.allowWake)
+    && (s.access.scope !== 'characters' || s.access.characterIds.includes(String(characterId))))
+    .flatMap(s => { try { return [resolveMcpBinding(s, characterId).identity]; } catch { return []; } });
+}
+
+export function assertCurrentMcpBinding(identity, { wake = false } = {}) {
+  const s = getMcpServer(identity?.serverId);
+  if (!s?.enabled || (wake && !s.access.allowWake)
+      || (s.access.scope === 'characters' && !s.access.characterIds.includes(identity?.characterId))) throw identityError('MCP 授权已撤销。');
+  const current = resolveMcpBinding(s, identity.characterId).identity;
+  if (current.accountId !== identity.accountId || current.revision !== identity.revision) throw identityError('MCP 账号绑定已变化；旧执行结果已隔离。');
+  return current;
+}
+
+export function listMcpWakeReadGrants(identity) {
+  if (!identity) return [];
+  try { assertCurrentMcpBinding(identity, { wake: true }); } catch { return []; }
+  const grants = readJson(MCP_WAKE_READ_KEY, []);
+  return (Array.isArray(grants) ? grants : []).filter(item => item.serverId === identity.serverId
+    && item.characterId === identity.characterId && item.accountId === identity.accountId
+    && item.revision === identity.revision).map(item => ({ ...item }));
+}
+
+export function setMcpWakeReadGrant(identity, toolName, fingerprint, { approved = false, enabled = true } = {}) {
+  if (!approved) throw identityError('Wake 只读授权需要用户明确确认。');
+  assertCurrentMcpBinding(identity, { wake: true });
+  const name = String(toolName || '').trim();
+  const hash = String(fingerprint || '').trim();
+  if (!name || !/^[a-f0-9]{64}$/.test(hash)) throw identityError('工具描述指纹无效。');
+  const raw = readJson(MCP_WAKE_READ_KEY, []);
+  const grants = (Array.isArray(raw) ? raw : []).filter(item => !(item.serverId === identity.serverId
+    && item.characterId === identity.characterId && item.accountId === identity.accountId
+    && item.toolName === name));
+  if (enabled) grants.push({ serverId: identity.serverId, characterId: identity.characterId,
+    accountId: identity.accountId, revision: identity.revision, toolName: name, fingerprint: hash });
+  writeJson(MCP_WAKE_READ_KEY, grants);
+  return enabled;
+}
+
+export function listMcpWakePlayGrants(identity) {
+  if (!identity) return [];
+  try { assertCurrentMcpBinding(identity, { wake: true }); } catch { return []; }
+  const grants = readJson(MCP_WAKE_PLAY_KEY, []);
+  return (Array.isArray(grants) ? grants : []).filter(item => item.serverId === identity.serverId
+    && item.characterId === identity.characterId && item.accountId === identity.accountId
+    && item.revision === identity.revision && item.toolName === 'play').map(item => ({ ...item }));
+}
+
+export function setMcpWakePlayGrant(identity, fingerprint, { approved = false, enabled = true } = {}) {
+  if (!approved) throw identityError('Wake 游戏操作授权需要用户明确确认。');
+  assertCurrentMcpBinding(identity, { wake: true });
+  const hash = String(fingerprint || '').trim();
+  if (!/^[a-f0-9]{64}$/.test(hash)) throw identityError('工具描述指纹无效。');
+  const raw = readJson(MCP_WAKE_PLAY_KEY, []);
+  const grants = (Array.isArray(raw) ? raw : []).filter(item => !(item.serverId === identity.serverId
+    && item.characterId === identity.characterId && item.accountId === identity.accountId
+    && item.toolName === 'play'));
+  if (enabled) grants.push({ serverId: identity.serverId, characterId: identity.characterId,
+    accountId: identity.accountId, revision: identity.revision, toolName: 'play', fingerprint: hash });
+  writeJson(MCP_WAKE_PLAY_KEY, grants);
+  return enabled;
+}

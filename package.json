@@ -1,0 +1,17 @@
+{
+  "name": "moli-cloud-skip-mvp",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node cloud-executor/scripts/build.mjs",
+    "test": "node --test tests/cloud-*.test.mjs",
+    "test:browser": "node tests/cloud-browser.cjs",
+    "dev": "wrangler dev --config cloud-executor/wrangler.jsonc"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.5",
+    "miniflare": "4.20260730.0",
+    "wrangler": "4.140.0"
+  }
+}
